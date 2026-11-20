@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+pnpm-lock.yaml
+
+# build output
+dist/
+build/
+*.tgz
+
+# logs / temp
+*.log
+npm-debug.log*
+logs/
+*.tmp
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# local captures
+*.png
+!icon.png

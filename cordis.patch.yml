@@ -1,0 +1,4 @@
+- insert:
+    - id: screenshot-button
+      name: '@local/screenshot-button'
+      config: {}
