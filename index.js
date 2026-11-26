@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process'
+﻿import { execFile } from 'node:child_process'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -15,6 +15,9 @@ const VARIANTS = [
   { pattern: /^\s*full\s*$/iu, args: ['-Mode', 'full'] },
   { pattern: /^\s*(overlay|self)\s*$/iu, args: ['-Engine', 'overlay'] },
   { pattern: /^\s*native\s*$/iu, args: ['-Engine', 'native'] },
+  // Self-check: drives a rectangle through the snipping overlay by itself, so the
+  // whole capture chain can be proven without touching the mouse.
+  { pattern: /^\s*(probe|selftest|自检)\s*$/iu, args: ['-Probe'] },
 ]
 
 /**
@@ -48,7 +51,7 @@ export function apply(ctx) {
   ctx.effect(() => ctx.commands.register({
     name: 'snip',
     description: '区域截图（用系统截图工具，Esc 取消；输入 full 截整屏，overlay 用插件自绘覆盖层）',
-    input: { hint: 'full | overlay | native' },
+    input: { hint: 'full | overlay | native | probe' },
     handler: async ({ rawInput }) => {
       const variant = VARIANTS.find(entry => entry.pattern.test(rawInput ?? '')) ?? VARIANTS[0]
       try {
