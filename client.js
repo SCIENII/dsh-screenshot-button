@@ -62,6 +62,15 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // The capture lands on the clipboard, so hand focus back to the composer:
+    // Ctrl+V then reaches the draft instead of whatever had focus before.
+    function focusComposer() {
+      if (typeof document === 'undefined') return
+      const editors = document.querySelectorAll('[contenteditable="true"], [contenteditable=""]')
+      const editor = editors[editors.length - 1]
+      if (editor instanceof HTMLElement) editor.focus()
+    }
+
     function commandsRemote(ctx) {
       const read = (key) => (typeof ctx.get === 'function' ? ctx.get(key) : undefined)
       const direct = read('remote.commands') ?? ctx['remote.commands']
@@ -101,6 +110,7 @@ window.__ModuleLoader__.load({
           return
         }
         if (outcome.text) showToast(outcome.text)
+        focusComposer()
       } catch (error) {
         showToast(`${t('error.prefix')}${error instanceof Error ? error.message : String(error)}`)
       }

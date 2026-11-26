@@ -1,7 +1,7 @@
 {
   "meta": {
-    "title": "Screenshot button",
-    "description": "Adds a screenshot button next to the composer's voice-input key: one click starts a Windows region snip and drops the result on the clipboard, ready to paste. The capture runs in the Host process through PowerShell, so it does not need renderer screen-capture permissions.",
+    "title": "Screenshot shortcut",
+    "description": "Adds a screenshot button next to the composer's voice key: it launches the Windows snipping overlay, then saves the capture and puts both a bitmap and the PNG file on the clipboard so you can paste it into the conversation. Capture runs in the Host process, bypassing the renderer's capture and protocol restrictions.",
     "detail": "docs/DETAIL.md"
   }
 }

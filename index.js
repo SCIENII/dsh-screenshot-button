@@ -9,21 +9,28 @@ const POWERSHELL = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'Wi
 
 export const inject = ['commands']
 
+/** Words accepted after /snip, mapped to the snip.ps1 arguments they select. */
+const VARIANTS = [
+  { pattern: /^\s*$/u, args: [] },
+  { pattern: /^\s*full\s*$/iu, args: ['-Mode', 'full'] },
+  { pattern: /^\s*(overlay|self)\s*$/iu, args: ['-Engine', 'overlay'] },
+  { pattern: /^\s*native\s*$/iu, args: ['-Engine', 'native'] },
+]
+
 /**
- * Run the region-snipper on the Host process (not the Electron renderer,
- * whose session denies display capture, clipboard permissions and custom
- * protocol navigation).
- * @param full - capture the whole virtual screen without an overlay.
- * @returns captured file path and whether the image reached the clipboard.
+ * Run the snipper in the Host process. The Electron renderer cannot do this:
+ * its session denies display capture, clipboard permissions and custom
+ * protocol navigation, so region selection has to happen outside the page.
+ * @param args - extra snip.ps1 switches selecting the capture variant.
+ * @returns the captured path and whether it reached the clipboard.
  */
-function runSnip(full) {
+function runSnip(args) {
   const stamp = new Date().toISOString().replace(/[:.]/gu, '-')
   const out = join(tmpdir(), 'dsh-snips', `snip-${stamp}.png`)
-  const args = [ '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', SCRIPT, '-Out', out ]
-  if (full) args.push('-Full')
+  const argv = [ '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', SCRIPT, '-Out', out, ...args ]
 
   return new Promise((resolve, reject) => {
-    execFile(POWERSHELL, args, { windowsHide: true, timeout: 300_000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+    execFile(POWERSHELL, argv, { windowsHide: true, timeout: 300_000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
       const text = `${stdout ?? ''}\n${stderr ?? ''}`
       if (/^CANCEL$/mu.test(stdout ?? '')) return resolve({ cancelled: true })
       if (error) {
@@ -40,17 +47,17 @@ function runSnip(full) {
 export function apply(ctx) {
   ctx.effect(() => ctx.commands.register({
     name: 'snip',
-    description: '区域截图，圈选后自动复制到剪贴板（输入 full 截整屏）',
-    input: { hint: 'full' },
+    description: '区域截图（用系统截图工具，Esc 取消；输入 full 截整屏，overlay 用插件自绘覆盖层）',
+    input: { hint: 'full | overlay | native' },
     handler: async ({ rawInput }) => {
-      const full = /^\s*full\s*$/iu.test(rawInput ?? '')
+      const variant = VARIANTS.find(entry => entry.pattern.test(rawInput ?? '')) ?? VARIANTS[0]
       try {
-        const result = await runSnip(full)
+        const result = await runSnip(variant.args)
         if (result.cancelled) return { kind: 'success', text: '截图已取消' }
         return {
           kind: 'success',
           text: result.copied
-            ? '截图已复制到剪贴板，回到输入框按 Ctrl+V 粘贴'
+            ? '截图已在剪贴板，回到输入框按 Ctrl+V 粘贴（也可直接把图片拖进来）'
             : `截图已保存到 ${result.path}（剪贴板写入未完成，可直接拖入输入框）`,
         }
       } catch (error) {

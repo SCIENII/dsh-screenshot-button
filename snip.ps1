@@ -1,9 +1,11 @@
 ﻿param(
   [Parameter(Mandatory = $true)][string]$Out,
-  [switch]$Full,
+  [ValidateSet('region', 'full')][string]$Mode = 'region',
+  [ValidateSet('auto', 'native', 'overlay')][string]$Engine = 'auto',
+  [int]$TimeoutSec = 120,
+  [switch]$NoClipboard,
   [switch]$Test,
-  [switch]$Probe,
-  [switch]$NoClipboard
+  [switch]$Probe
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,11 +14,16 @@ Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
-public static class SnipDpi {
+public static class SnipWin {
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, IntPtr e);
+  public const uint LEFTDOWN = 0x0002;
+  public const uint LEFTUP = 0x0004;
 }
 "@
-try { [SnipDpi]::SetProcessDPIAware() | Out-Null } catch { }
+try { [SnipWin]::SetProcessDPIAware() | Out-Null } catch { }
 
 $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
 
@@ -28,11 +35,9 @@ function New-ScreenShot {
 }
 
 function Get-SelectionRect($a, $b) {
-  $x = [Math]::Min($a.X, $b.X)
-  $y = [Math]::Min($a.Y, $b.Y)
-  $w = [Math]::Abs($a.X - $b.X)
-  $h = [Math]::Abs($a.Y - $b.Y)
-  return New-Object System.Drawing.Rectangle($x, $y, $w, $h)
+  return New-Object System.Drawing.Rectangle(
+    [Math]::Min($a.X, $b.X), [Math]::Min($a.Y, $b.Y),
+    [Math]::Abs($a.X - $b.X), [Math]::Abs($a.Y - $b.Y))
 }
 
 function Save-Crop($shot, $rect) {
@@ -41,35 +46,104 @@ function Save-Crop($shot, $rect) {
   return $shot.Clone($clamped, $shot.PixelFormat)
 }
 
-function Set-ClipboardImage($image) {
-  for ($i = 0; $i -lt 4; $i++) {
+function Get-ClipboardImage {
+  if (-not [System.Windows.Forms.Clipboard]::ContainsImage()) { return $null }
+  try { return [System.Windows.Forms.Clipboard]::GetImage() } catch { return $null }
+}
+
+# Put the capture on the clipboard in two shapes at once: as a bitmap (classic
+# paste) and as a file drop list (so the composer's file-paste router takes it
+# even when no file item is synthesized from a bare bitmap).
+function Set-ClipboardCapture($image, $path) {
+  for ($i = 0; $i -lt 5; $i++) {
     try {
-      [System.Windows.Forms.Clipboard]::SetImage($image)
+      $payload = New-Object System.Windows.Forms.DataObject
+      $payload.SetImage($image)
+      if ($path) {
+        $list = New-Object System.Collections.Specialized.StringCollection
+        $list.Add($path) | Out-Null
+        $payload.SetFileDropList($list)
+      }
+      [System.Windows.Forms.Clipboard]::SetDataObject($payload, $true)
       return $true
     } catch {
-      Start-Sleep -Milliseconds 120
+      Start-Sleep -Milliseconds 150
     }
   }
   return $false
 }
 
-$script:shot = New-ScreenShot
-$script:start = $null
-$script:cur = $null
-$script:accepted = $false
+function Save-Image($image, $path) {
+  $dir = [System.IO.Path]::GetDirectoryName($path)
+  if ($dir -and -not [System.IO.Directory]::Exists($dir)) { [System.IO.Directory]::CreateDirectory($dir) | Out-Null }
+  $image.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+}
 
-if ($Test) {
-  $script:accepted = $true
-  $script:start = New-Object System.Drawing.Point(60, 60)
-  $script:cur = New-Object System.Drawing.Point(460, 360)
+# --- native engine: let the Windows snipper do the overlay -------------------
+# Start-Process goes through ShellExecute, which activates the AppX protocol
+# registered for ms-screenclip:. That is the same overlay Win+Shift+S shows,
+# so there is no window of ours to fight for focus, activation or DPI.
+
+function Invoke-NativeSnipper {
+  $known = @(Get-Process SnippingTool -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+
+  if ($Test -or $Probe) {
+    Start-Process 'ms-screenclip:'
+  } else {
+    Start-Process 'ms-screenclip:'
+  }
+
+  # Wait for the overlay process to appear so a synthetic drag lands on it.
+  $deadline = (Get-Date).AddSeconds(8)
+  while ((Get-Date) -lt $deadline) {
+    $live = @(Get-Process SnippingTool -ErrorAction SilentlyContinue | Where-Object { $known -notcontains $_.Id })
+    if ($live.Count -gt 0) { break }
+    Start-Sleep -Milliseconds 100
+  }
+
+  if ($Probe) {
+    # Drive a rectangle through the overlay the same way a mouse would.
+    Start-Sleep -Milliseconds 900
+    [SnipWin]::SetCursorPos(240, 240) | Out-Null
+    Start-Sleep -Milliseconds 200
+    [SnipWin]::mouse_event([SnipWin]::LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)
+    for ($step = 1; $step -le 12; $step++) {
+      [SnipWin]::SetCursorPos(240 + [int](620 * $step / 12), 240 + [int](400 * $step / 12)) | Out-Null
+      Start-Sleep -Milliseconds 45
+    }
+    Start-Sleep -Milliseconds 200
+    [SnipWin]::mouse_event([SnipWin]::LEFTUP, 0, 0, 0, [IntPtr]::Zero)
+  }
+
+  $clock = (Get-Date).AddSeconds($TimeoutSec)
+  while ((Get-Date) -lt $clock) {
+    if ([SnipWin]::GetClipboardSequenceNumber() -ne $script:seq) {
+      # Clipboard changed: give the snipper a moment to finish writing.
+      Start-Sleep -Milliseconds 260
+      $image = Get-ClipboardImage
+      if ($image) { return $image }
+    }
+    $stillOpen = @(Get-Process SnippingTool -ErrorAction SilentlyContinue | Where-Object { $known -notcontains $_.Id })
+    if ($stillOpen.Count -eq 0 -and [SnipWin]::GetClipboardSequenceNumber() -eq $script:seq) {
+      Start-Sleep -Milliseconds 300
+      if ([SnipWin]::GetClipboardSequenceNumber() -eq $script:seq) { return $null }
+    }
+    Start-Sleep -Milliseconds 120
+  }
+  return $null
 }
-elseif ($Full) {
-  $script:accepted = $true
-}
-else {
+
+# --- overlay engine: our own full-screen rubber band ------------------------
+
+function Invoke-OverlaySnipper {
+  $shot = New-ScreenShot
+  $script:overlayShot = $shot
+  if ($Test) {
+    return (Save-Crop $shot (New-Object System.Drawing.Rectangle(60, 60, 400, 300)))
+  }
+
   $veil = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(110, 0, 0, 0))
   $edge = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 36, 123, 191)), 2
-  $clear = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::Transparent)
   $font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11)
   $label = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(235, 255, 255, 255))
   $labelBack = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(190, 0, 0, 0))
@@ -84,22 +158,20 @@ else {
   $form.Cursor = [System.Windows.Forms.Cursors]::Cross
   $form.BackColor = [System.Drawing.Color]::Black
 
-  # DoubleBuffered 是 Control 的 protected 属性，直接 $form.DoubleBuffered = $true
-  # 会抛 PropertyAssignmentException，必须走反射设置。
+  # DoubleBuffered is protected; assigning it directly throws PropertyAssignmentException.
   try {
-    $dbProp = [System.Windows.Forms.Control].GetProperty(
+    $prop = [System.Windows.Forms.Control].GetProperty(
       'DoubleBuffered',
-      [System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::NonPublic
-    )
-    if ($dbProp) { $dbProp.SetValue($form, $true, $null) }
+      [System.Reflection.BindingFlags]::Instance -bor [System.Reflection.BindingFlags]::NonPublic)
+    if ($prop) { $prop.SetValue($form, $true, $null) }
   } catch { }
 
   $form.Add_Paint({
     param($s, $e)
     $g = $e.Graphics
-    $w = $script:shot.Width
-    $h = $script:shot.Height
-    $g.DrawImage($script:shot, 0, 0, $w, $h)
+    $w = $script:overlayShot.Width
+    $h = $script:overlayShot.Height
+    $g.DrawImage($script:overlayShot, 0, 0, $w, $h)
     if ($script:start -and $script:cur) {
       $r = Get-SelectionRect $script:start $script:cur
       if ($r.Width -gt 0 -and $r.Height -gt 0) {
@@ -112,13 +184,12 @@ else {
     } else {
       $g.FillRectangle($veil, 0, 0, $w, $h)
     }
-    $hint = '拖动鼠标选择截图区域，Esc 取消'
+    $hint = '拖动鼠标选择区域，Esc 取消'
     $size = $g.MeasureString($hint, $font)
     $hx = [Math]::Round(($w - $size.Width) / 2)
     $g.FillRectangle($labelBack, $hx - 12, 28, $size.Width + 24, $size.Height + 12)
     $g.DrawString($hint, $font, $label, $hx, 34)
   })
-
   $form.Add_MouseDown({
     param($s, $e)
     if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
@@ -160,7 +231,6 @@ else {
     $form.Activate()
     $form.Focus() | Out-Null
     if ($Probe) {
-      # 无人工干预地跑完整覆盖层流程：第一拍画出选框，第二拍接受并关闭。
       $script:probeTick = 0
       $script:probeTimer = New-Object System.Windows.Forms.Timer
       $script:probeTimer.Interval = 400
@@ -191,34 +261,42 @@ else {
   [System.Windows.Forms.Application]::EnableVisualStyles()
   [System.Windows.Forms.Application]::Run($form)
   $form.Dispose()
+
+  if (-not $script:accepted) { return $null }
+  if (-not $script:start -or -not $script:cur) { return $null }
+  return (Save-Crop $shot (Get-SelectionRect $script:start $script:cur))
 }
 
-if (-not $script:accepted) {
-  $script:shot.Dispose()
-  Write-Output 'CANCEL'
-  exit 0
-}
+# --- entry -----------------------------------------------------------------
 
-if ($Full) {
-  $result = $script:shot
+$script:overlayShot = $null
+$script:start = $null
+$script:cur = $null
+$script:accepted = $false
+$script:seq = [SnipWin]::GetClipboardSequenceNumber()
+
+if ($Mode -eq 'full') {
+  $result = New-ScreenShot
 } else {
-  $rect = Get-SelectionRect $script:start $script:cur
-  $result = Save-Crop $script:shot $rect
+  $engine = $Engine
+  if ($engine -eq 'auto') {
+    # The native snipper needs the AppX protocol; fall back when it is absent.
+    $engine = if ((Get-Command Start-Process) -and (Test-Path 'Registry::HKEY_CLASSES_ROOT\ms-screenclip')) { 'native' } else { 'overlay' }
+  }
+  $result = if ($engine -eq 'native') { Invoke-NativeSnipper } else { Invoke-OverlaySnipper }
 }
 
 if ($null -eq $result) {
-  $script:shot.Dispose()
+  if ($script:overlayShot) { $script:overlayShot.Dispose() }
   Write-Output 'CANCEL'
   exit 0
 }
 
-$dir = [System.IO.Path]::GetDirectoryName($Out)
-if ($dir -and -not [System.IO.Directory]::Exists($dir)) { [System.IO.Directory]::CreateDirectory($dir) | Out-Null }
-$result.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
+Save-Image $result $Out
 $copied = $false
-if (-not $NoClipboard) { $copied = Set-ClipboardImage $result }
-if (-not [object]::ReferenceEquals($result, $script:shot)) { $result.Dispose() }
-$script:shot.Dispose()
+if (-not $NoClipboard) { $copied = Set-ClipboardCapture $result $Out }
+if (-not [object]::ReferenceEquals($result, $script:overlayShot)) { $result.Dispose() }
+if ($script:overlayShot) { $script:overlayShot.Dispose() }
 
 Write-Output "OK:$Out"
 Write-Output ("COPIED:" + $copied.ToString().ToLowerInvariant())
